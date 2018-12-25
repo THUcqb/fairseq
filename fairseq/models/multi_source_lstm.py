@@ -10,7 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fairseq import options, utils
-from fairseq.models.lstm import LSTMEncoder, LSTMDecoder, Embedding, LSTM
+from fairseq.models.lstm import LSTMEncoder, LSTMDecoder, Embedding, LSTM, LSTMCell, Linear, AttentionLayer
+from fairseq.models.fconv import FConvEncoder
 from fairseq.modules import AdaptiveSoftmax
 from . import (
     FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model,
@@ -149,7 +150,7 @@ class MultiSourceLSTMModel(FairseqModel):
             bidirectional=args.encoder_bidirectional,
             pretrained_embed=pretrained_encoder_embed,
         )
-        decoder = LSTMDecoder(
+        decoder = MultiSourceLSTMDecoder(
             dictionary=task.target_dictionary,
             embed_dim=args.decoder_embed_dim,
             hidden_size=args.decoder_hidden_size,
@@ -204,13 +205,18 @@ class MultiSourceLSTMEncoder(FairseqEncoder):
             dropout=self.dropout_out if num_layers > 1 else 0.,
             bidirectional=bidirectional,
         )
-        self.lstm2 = LSTM(
-            input_size=embed_dim,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=self.dropout_out if num_layers > 1 else 0.,
-            bidirectional=bidirectional,
-        )
+        # self.lstm2 = LSTM(
+        #     input_size=embed_dim,
+        #     hidden_size=hidden_size,
+        #     num_layers=num_layers,
+        #     dropout=self.dropout_out if num_layers > 1 else 0.,
+        #     bidirectional=bidirectional,
+        # )
+        if self.bidirectional:
+            self.fconv2 = FConvEncoder(dictionary[1], 2 * embed_dim, convolutions=[(512, 3)] * 15, dropout=dropout_in, left_pad=left_pad)
+        else:
+            self.fconv2 = FConvEncoder(dictionary[1], embed_dim, convolutions=[(512, 3)] * 15, dropout=dropout_in, left_pad=left_pad)
+        self.fconv2.num_attention_layers = 1
         self.left_pad = left_pad
         self.padding_value = padding_value
 
@@ -229,20 +235,22 @@ class MultiSourceLSTMEncoder(FairseqEncoder):
                 self.padding_idx_1,
                 left_to_right=True,
             )
-            src_tokens2 = utils.convert_padding_direction(
-                src_tokens2,
-                self.padding_idx_2,
-                left_to_right=True,
-            )
+            # src_tokens2 = utils.convert_padding_direction(
+            #     src_tokens2,
+            #     self.padding_idx_2,
+            #     left_to_right=True,
+            # )
 
         bsz1, seqlen1 = src_tokens1.size()
-        bsz2, seqlen2 = src_tokens2.size()
+        # bsz2, seqlen2 = src_tokens2.size()
 
         # embed tokens
         x1 = self.embed_tokens_1(src_tokens1)
         x1 = F.dropout(x1, p=self.dropout_in, training=self.training)
-        x2 = self.embed_tokens_2(src_tokens2)
-        x2 = F.dropout(x2, p=self.dropout_in, training=self.training)
+        # x2 = self.embed_tokens_2(src_tokens2)
+        # x2 = F.dropout(x2, p=self.dropout_in, training=self.training)
+        fconv_dict = self.fconv2(src_tokens2, src_lengths2)
+        x2 = fconv_dict["encoder_out"][0]
 
         # B x T x C -> T x B x C
         x1 = x1.transpose(0, 1)
@@ -293,9 +301,9 @@ class MultiSourceLSTMEncoder(FairseqEncoder):
 
         # HACK: pass hidden state of source 1 (title) to decoder 
         return {
-            'encoder_out': (x, None, None),
             'encoder_out': (x, final_hiddens_1, final_cells_1),
-            'encoder_padding_mask': encoder_padding_mask if encoder_padding_mask.any() else None
+            'encoder_padding_mask': encoder_padding_mask if encoder_padding_mask.any() else None,
+            'segments': [x1.shape[0]]
         }
 
     def reorder_encoder_out(self, encoder_out, new_order):
@@ -311,6 +319,174 @@ class MultiSourceLSTMEncoder(FairseqEncoder):
     def max_positions(self):
         """Maximum input length supported by the encoder."""
         return int(1e5)  # an arbitrary large number
+
+class MultiSourceLSTMDecoder(FairseqIncrementalDecoder):
+    """LSTM decoder."""
+    def __init__(
+        self, dictionary, embed_dim=512, hidden_size=512, out_embed_dim=512,
+        num_layers=1, dropout_in=0.1, dropout_out=0.1, attention=True,
+        encoder_embed_dim=512, encoder_output_units=512, pretrained_embed=None,
+        share_input_output_embed=False, adaptive_softmax_cutoff=None,
+    ):
+        super().__init__(dictionary)
+        self.dropout_in = dropout_in
+        self.dropout_out = dropout_out
+        self.hidden_size = hidden_size
+        self.share_input_output_embed = share_input_output_embed
+        self.need_attn = True
+
+        self.adaptive_softmax = None
+        num_embeddings = len(dictionary)
+        padding_idx = dictionary.pad()
+        if pretrained_embed is None:
+            self.embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
+        else:
+            self.embed_tokens = pretrained_embed
+
+        self.encoder_output_units = encoder_output_units
+        assert encoder_output_units == hidden_size, \
+            'encoder_output_units ({}) != hidden_size ({})'.format(encoder_output_units, hidden_size)
+        # TODO another Linear layer if not equal
+
+        self.layers = nn.ModuleList([
+            LSTMCell(
+                input_size=encoder_output_units + embed_dim if layer == 0 else hidden_size,
+                hidden_size=hidden_size,
+            )
+            for layer in range(num_layers)
+        ])
+        self.attention_1 = AttentionLayer(encoder_output_units, hidden_size) if attention else None
+        self.attention_2 = AttentionLayer(encoder_output_units, hidden_size) if attention else None
+        # self.attention_combine_fc = Linear(2 * hidden_size, hidden_size)
+        if hidden_size != out_embed_dim:
+            self.additional_fc = Linear(hidden_size, out_embed_dim)
+        if adaptive_softmax_cutoff is not None:
+            # setting adaptive_softmax dropout to dropout_out for now but can be redefined
+            self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, embed_dim, adaptive_softmax_cutoff,
+                                                    dropout=dropout_out)
+        elif not self.share_input_output_embed:
+            self.fc_out = Linear(out_embed_dim, num_embeddings, dropout=dropout_out)
+
+
+    def forward(self, prev_output_tokens, encoder_out_dict, incremental_state=None):
+        encoder_out = encoder_out_dict['encoder_out']
+        encoder_padding_mask = encoder_out_dict['encoder_padding_mask']
+
+        if incremental_state is not None:
+            prev_output_tokens = prev_output_tokens[:, -1:]
+        bsz, seqlen = prev_output_tokens.size()
+
+        # get outputs from encoder
+        encoder_outs, _, _ = encoder_out[:3]
+        segment_1 = encoder_out_dict['segments'][0]
+        srclen = encoder_outs.size(0)# - encoder_out_dict['segments'][0]
+
+        # embed tokens
+        x = self.embed_tokens(prev_output_tokens)
+        x = F.dropout(x, p=self.dropout_in, training=self.training)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        # initialize previous states (or get from cache during incremental generation)
+        cached_state = utils.get_incremental_state(self, incremental_state, 'cached_state')
+        if cached_state is not None:
+            prev_hiddens, prev_cells, input_feed = cached_state
+        else:
+            _, encoder_hiddens, encoder_cells = encoder_out[:3]
+            num_layers = len(self.layers)
+            prev_hiddens = [encoder_hiddens[i] for i in range(num_layers)]
+            prev_cells = [encoder_cells[i] for i in range(num_layers)]
+            input_feed = x.data.new(bsz, self.encoder_output_units).zero_()
+
+        attn_scores = x.data.new(srclen, seqlen, bsz).zero_()
+        outs = []
+        for j in range(seqlen):
+            # input feeding: concatenate context vector from previous time step
+            input = torch.cat((x[j, :, :], input_feed), dim=1)
+
+            for i, rnn in enumerate(self.layers):
+                # recurrent cell
+                hidden, cell = rnn(input, (prev_hiddens[i], prev_cells[i]))
+
+                # hidden state becomes the input to the next layer
+                input = F.dropout(hidden, p=self.dropout_out, training=self.training)
+
+                # save state for next time step
+                prev_hiddens[i] = hidden
+                prev_cells[i] = cell
+
+            # apply attention using the last layer's hidden state
+            if self.attention_1 is not None and self.attention_2 is not None:
+                # A two-step attention
+                # 1 attend hidden state on the headline encoder outputs
+                # 2 attend the above result on the title encoder outputs
+                if encoder_padding_mask is not None:
+                    out, attn_scores[segment_1:, j, :] = self.attention_2(hidden, encoder_outs[segment_1:], encoder_padding_mask[segment_1:])
+                    out, attn_scores[:segment_1, j, :] = self.attention_1(out, encoder_outs[:segment_1], encoder_padding_mask[:segment_1])
+                    # out_1, attn_scores[:segment_1, j, :] = self.attention_1(hidden, encoder_outs[:segment_1], encoder_padding_mask[:segment_1])
+                    # out_2, attn_scores[segment_1:, j, :] = self.attention_2(hidden, encoder_outs[segment_1:], encoder_padding_mask[segment_1:])
+                    # out = F.tanh(self.attention_combine_fc(torch.cat([out_1, out_2], dim=1)))
+                else:
+                    out, attn_scores[:segment_1, j, :] = self.attention_1(hidden, encoder_outs[:segment_1], None)
+                    out, attn_scores[segment_1:, j, :] = self.attention_2(out, encoder_outs[segment_1:], None)
+            else:
+                out = hidden
+            out = F.dropout(out, p=self.dropout_out, training=self.training)
+
+            # input feeding
+            input_feed = out
+
+            # save final output
+            outs.append(out)
+
+        # cache previous states (no-op except during incremental generation)
+        utils.set_incremental_state(
+            self, incremental_state, 'cached_state', (prev_hiddens, prev_cells, input_feed))
+
+        # collect outputs across time steps
+        x = torch.cat(outs, dim=0).view(seqlen, bsz, self.hidden_size)
+
+        # T x B x C -> B x T x C
+        x = x.transpose(1, 0)
+
+        # srclen x tgtlen x bsz -> bsz x tgtlen x srclen
+        if not self.training and self.need_attn:
+            attn_scores = attn_scores.transpose(0, 2)
+        else:
+            attn_scores = None
+
+        # project back to size of vocabulary
+        if self.adaptive_softmax is None:
+            if hasattr(self, 'additional_fc'):
+                x = self.additional_fc(x)
+                x = F.dropout(x, p=self.dropout_out, training=self.training)
+            if self.share_input_output_embed:
+                x = F.linear(x, self.embed_tokens.weight)
+            else:
+                x = self.fc_out(x)
+        return x, attn_scores
+
+    def reorder_incremental_state(self, incremental_state, new_order):
+        super().reorder_incremental_state(incremental_state, new_order)
+        cached_state = utils.get_incremental_state(self, incremental_state, 'cached_state')
+        if cached_state is None:
+            return
+
+        def reorder_state(state):
+            if isinstance(state, list):
+                return [reorder_state(state_i) for state_i in state]
+            return state.index_select(0, new_order)
+
+        new_state = tuple(map(reorder_state, cached_state))
+        utils.set_incremental_state(self, incremental_state, 'cached_state', new_state)
+
+    def max_positions(self):
+        """Maximum output length supported by the decoder."""
+        return int(1e5)  # an arbitrary large number
+
+    def make_generation_fast_(self, need_attn=False, **kwargs):
+        self.need_attn = need_attn
 
 
 @register_model_architecture('multi_source_lstm', 'multi_source_lstm')
