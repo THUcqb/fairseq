@@ -13,13 +13,16 @@ from . import FairseqDataset
 
 
 class RoundRobinZipDatasets(FairseqDataset):
-    """Zip multiple FairseqDatasets together, repeating shorter datasets in a
-    round-robin fashion to match the length of the longest one.
+    """Zip multiple :class:`~fairseq.data.FairseqDataset` instances together.
+
+    Shorter datasets are repeated in a round-robin fashion to match the length
+    of the longest one.
 
     Args:
-        datasets: a dictionary of FairseqDatasets
-        eval_key: an optional key used at evaluation time that causes this
-            instance to pass-through batches from `datasets[eval_key]`.
+        datasets (Dict[~fairseq.data.FairseqDataset]): a dictionary of
+            :class:`~fairseq.data.FairseqDataset` instances.
+        eval_key (str, optional): a key used at evaluation time that causes
+            this instance to pass-through batches from *datasets[eval_key]*.
     """
 
     def __init__(self, datasets, eval_key=None):
@@ -36,12 +39,11 @@ class RoundRobinZipDatasets(FairseqDataset):
                 self.longest_dataset = dataset
                 self.longest_dataset_key = key
 
-        self._ordered_indices = OrderedDict([
-            (key, dataset.ordered_indices())
-            for key, dataset in datasets.items()
-        ])
+        self._ordered_indices = None
 
     def _map_index(self, key, index):
+        assert self._ordered_indices is not None, \
+                'Must call RoundRobinZipDatasets.ordered_indices() first'
         return self._ordered_indices[key][index % len(self.datasets[key])]
 
     def __getitem__(self, index):
@@ -99,11 +101,23 @@ class RoundRobinZipDatasets(FairseqDataset):
 
     def ordered_indices(self):
         """Ordered indices for batching."""
+        if self._ordered_indices is None:
+            # Call the underlying dataset's ordered_indices() here, so that we
+            # get the same random ordering as we would have from using the
+            # underlying dataset directly.
+            self._ordered_indices = OrderedDict([
+                (key, dataset.ordered_indices())
+                for key, dataset in self.datasets.items()
+            ])
         return np.arange(len(self))
 
-    def valid_size(self, index, max_positions):
-        """Check if an example's size is valid according to max_positions."""
+    @property
+    def supports_prefetch(self):
         return all(
-            dataset.valid_size(self._map_index(key, index), max_positions[key])
-            for key, dataset in self.datasets.items()
+            getattr(dataset, 'supports_prefetch', False)
+            for dataset in self.datasets.values()
         )
+
+    def prefetch(self, indices):
+        for key, dataset in self.datasets.items():
+            dataset.prefetch([self._map_index(key, index) for index in indices])

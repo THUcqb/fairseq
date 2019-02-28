@@ -29,7 +29,7 @@ class BaseFairseqModel(nn.Module):
     @classmethod
     def build_model(cls, args, task):
         """Build a new model instance."""
-        raise NotImplementedError
+        raise NotImplementedError('FairseqModels must implement the build_model method')
 
     def get_targets(self, sample, net_output):
         """Get targets from either the sample or the net's output."""
@@ -117,7 +117,7 @@ class BaseFairseqModel(nn.Module):
 
         self.apply(apply_make_generation_fast_)
 
-        def train(mode):
+        def train(mode=True):
             if mode:
                 raise RuntimeError('cannot train after make_generation_fast')
 

@@ -12,8 +12,12 @@ import torch
 
 from fairseq import options
 from fairseq.data import (
-    Dictionary, LanguagePairDataset, IndexedInMemoryDataset,
-    IndexedRawTextDataset, RoundRobinZipDatasets,
+    Dictionary,
+    IndexedCachedDataset,
+    IndexedDataset,
+    IndexedRawTextDataset,
+    LanguagePairDataset,
+    RoundRobinZipDatasets,
 )
 from fairseq.models import FairseqMultiModel
 
@@ -55,6 +59,8 @@ class MultilingualTranslationTask(FairseqTask):
                             help='source language (only needed for inference)')
         parser.add_argument('-t', '--target-lang', default=None, metavar='TARGET',
                             help='target language (only needed for inference)')
+        parser.add_argument('--lazy-load', action='store_true',
+                            help='load the dataset lazily')
         parser.add_argument('--raw-text', action='store_true',
                             help='load raw text dataset')
         parser.add_argument('--left-pad-source', default='True', type=str, metavar='BOOL',
@@ -70,6 +76,7 @@ class MultilingualTranslationTask(FairseqTask):
     def __init__(self, args, dicts, training):
         super().__init__(args)
         self.dicts = dicts
+        self.lang_pairs = args.lang_pairs
         self.langs = list(dicts.keys())
         self.training = training
 
@@ -112,22 +119,22 @@ class MultilingualTranslationTask(FairseqTask):
             filename = os.path.join(self.args.data, '{}.{}-{}.{}'.format(split, src, tgt, lang))
             if self.args.raw_text and IndexedRawTextDataset.exists(filename):
                 return True
-            elif not self.args.raw_text and IndexedInMemoryDataset.exists(filename):
+            elif not self.args.raw_text and IndexedDataset.exists(filename):
                 return True
             return False
 
         def indexed_dataset(path, dictionary):
             if self.args.raw_text:
                 return IndexedRawTextDataset(path, dictionary)
-            elif IndexedInMemoryDataset.exists(path):
-                return IndexedInMemoryDataset(path, fix_lua_indexing=True)
+            elif IndexedDataset.exists(path):
+                if self.args.lazy_load:
+                    return IndexedDataset(path, fix_lua_indexing=True)
+                else:
+                    return IndexedCachedDataset(path, fix_lua_indexing=True)
             return None
 
-        def sort_lang_pair(lang_pair):
-            return '-'.join(sorted(lang_pair.split('-')))
-
         src_datasets, tgt_datasets = {}, {}
-        for lang_pair in set(map(sort_lang_pair, self.args.lang_pairs)):
+        for lang_pair in self.args.lang_pairs:
             src, tgt = lang_pair.split('-')
             if split_exists(split, src, tgt, src):
                 prefix = os.path.join(self.args.data, '{}.{}-{}.'.format(split, src, tgt))
@@ -144,11 +151,7 @@ class MultilingualTranslationTask(FairseqTask):
 
         def language_pair_dataset(lang_pair):
             src, tgt = lang_pair.split('-')
-            if lang_pair in src_datasets:
-                src_dataset, tgt_dataset = src_datasets[lang_pair], tgt_datasets[lang_pair]
-            else:
-                lang_pair = sort_lang_pair(lang_pair)
-                tgt_dataset, src_dataset = src_datasets[lang_pair], tgt_datasets[lang_pair]
+            src_dataset, tgt_dataset = src_datasets[lang_pair], tgt_datasets[lang_pair]
             return LanguagePairDataset(
                 src_dataset, src_dataset.sizes, self.dicts[src],
                 tgt_dataset, tgt_dataset.sizes, self.dicts[tgt],
@@ -163,7 +166,16 @@ class MultilingualTranslationTask(FairseqTask):
                 (lang_pair, language_pair_dataset(lang_pair))
                 for lang_pair in self.args.lang_pairs
             ]),
-            eval_key=None if self.training else self.args.lang_pairs[0],
+            eval_key=None if self.training else "%s-%s" % (self.args.source_lang, self.args.target_lang),
+        )
+
+    def build_dataset_for_inference(self, src_tokens, src_lengths):
+        lang_pair = "%s-%s" % (self.args.source_lang, self.args.target_lang)
+        return RoundRobinZipDatasets(
+            OrderedDict([
+                (lang_pair, LanguagePairDataset(src_tokens, src_lengths, self.source_dictionary))
+            ]),
+            eval_key=lang_pair,
         )
 
     def build_model(self, args):
@@ -237,7 +249,8 @@ class MultilingualTranslationTask(FairseqTask):
             for k, v in agg_logging_output.items()
         }
         flat_logging_output['loss'] = sum_over_languages('loss')
-        flat_logging_output['nll_loss'] = sum_over_languages('nll_loss')
+        if any('nll_loss' in logging_output for logging_output in agg_logging_outputs.values()):
+            flat_logging_output['nll_loss'] = sum_over_languages('nll_loss')
         flat_logging_output['sample_size'] = sum_over_languages('sample_size')
         flat_logging_output['nsentences'] = sum_over_languages('nsentences')
         flat_logging_output['ntokens'] = sum_over_languages('ntokens')

@@ -9,7 +9,6 @@ import numpy as np
 import torch
 
 from . import data_utils, FairseqDataset
-from typing import List
 
 
 def collate(samples, pad_idx, eos_idx):
@@ -29,19 +28,24 @@ def collate(samples, pad_idx, eos_idx):
                 [s[key] for s in samples], pad_idx, eos_idx, left_pad=False,
             )
 
-    is_target_list = isinstance(samples[0]['target'], list)
+    src_tokens = merge('source')
+    if samples[0]['target'] is not None:
+        is_target_list = isinstance(samples[0]['target'], list)
+        target = merge('target', is_target_list)
+    else:
+        target = src_tokens
 
     return {
         'id': torch.LongTensor([s['id'] for s in samples]),
         'nsentences': len(samples),
         'ntokens': sum(len(s['source']) for s in samples),
         'net_input': {
-            'src_tokens': merge('source'),
+            'src_tokens': src_tokens,
             'src_lengths': torch.LongTensor([
                 s['source'].numel() for s in samples
             ]),
         },
-        'target': merge('target', is_target_list),
+        'target': target,
     }
 
 
@@ -53,8 +57,8 @@ class MonolingualDataset(FairseqDataset):
         dataset (torch.utils.data.Dataset): dataset to wrap
         sizes (List[int]): sentence lengths
         vocab (~fairseq.data.Dictionary): vocabulary
-        shuffle (bool, optional): shuffle the elements before batching.
-          Default: ``True``
+        shuffle (bool, optional): shuffle the elements before batching
+            (default: True).
     """
 
     def __init__(self, dataset, sizes, src_vocab, tgt_vocab, add_eos_for_other_targets, shuffle,
@@ -66,15 +70,19 @@ class MonolingualDataset(FairseqDataset):
         self.add_eos_for_other_targets = add_eos_for_other_targets
         self.shuffle = shuffle
 
-        assert targets is None or all(
-            t in {'self', 'future', 'past'} for t in targets), "targets must be none or one of 'self', 'future', 'past'"
+        assert targets is None or all(t in {'self', 'future', 'past'} for t in targets), \
+            "targets must be none or one of 'self', 'future', 'past'"
         if targets is not None and len(targets) == 0:
             targets = None
         self.targets = targets
 
     def __getitem__(self, index):
-        source, future_target, past_target = self.dataset[index]
-        source, target = self._make_source_target(source, future_target, past_target)
+        if self.targets is not None:
+            source, future_target, past_target = self.dataset[index]
+            source, target = self._make_source_target(source, future_target, past_target)
+        else:
+            source = self.dataset[index]
+            target = None
         return {'id': index, 'source': source, 'target': target}
 
     def __len__(self):
@@ -185,7 +193,7 @@ class MonolingualDataset(FairseqDataset):
 
     @property
     def supports_prefetch(self):
-        return self.dataset.supports_prefetch
+        return getattr(self.dataset, 'supports_prefetch', False)
 
     def prefetch(self, indices):
         self.dataset.prefetch(indices)

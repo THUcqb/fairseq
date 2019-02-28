@@ -4,14 +4,15 @@
 # This source code is licensed under the license found in the LICENSE file in
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
-
-from collections import defaultdict, OrderedDict
+import importlib.util
 import logging
 import os
 import re
-import torch
+import sys
 import traceback
+from collections import defaultdict, OrderedDict
 
+import torch
 from torch.serialization import default_restore_location
 
 
@@ -38,7 +39,7 @@ def convert_state_dict_type(state_dict, ttype=torch.FloatTensor):
         return state_dict
 
 
-def save_state(filename, args, model, criterion, optimizer, lr_scheduler,
+def save_state(filename, args, model_state_dict, criterion, optimizer, lr_scheduler,
                num_updates, optim_history=None, extra_state=None):
     if optim_history is None:
         optim_history = []
@@ -46,7 +47,7 @@ def save_state(filename, args, model, criterion, optimizer, lr_scheduler,
         extra_state = {}
     state_dict = {
         'args': args,
-        'model': model.state_dict() if model else {},
+        'model': model_state_dict if model_state_dict else {},
         'optimizer_history': optim_history + [
             {
                 'criterion_name': criterion.__class__.__name__,
@@ -434,3 +435,15 @@ def resolve_max_positions(*args):
                     map(nullsafe_min, zip(max_positions, arg))
                 )
     return max_positions
+
+
+def import_user_module(args):
+    module_path = getattr(args, 'user_dir', None)
+    if module_path is not None:
+        module_path = os.path.abspath(args.user_dir)
+        module_parent, module_name = os.path.split(module_path)
+
+        if module_name not in sys.modules:
+            sys.path.insert(0, module_parent)
+            importlib.import_module(module_name)
+            sys.path.pop(0)

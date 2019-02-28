@@ -7,8 +7,48 @@
 
 import contextlib
 import os
-
+import math
 import numpy as np
+
+
+def mask(sentence, mask_id, pad_id, dictionary_token_range, mask_ratio=.15):
+    """mask tokens for masked language model training
+    Samples mask_ratio tokens that will be predicted by LM.
+    - 80%: Replace the word with mask_id
+    - 10%: replate the word with random token within dictionary_token_range
+    - 10%: keeps word unchanged
+    This function may not be efficient enough since we had multiple conversions
+    between np and torch, we can replace them with torch operators later
+    Args:
+        sentence: 1d tensor to be masked
+        mask_id: index to use for masking the sentence
+        pad_id: index to use for masking the target for tokens we aren't predicting
+        dictionary_token_range: range of indices in dictionary which can be used
+            for random word replacement (e.g. without special characters)
+        mask_ratio: ratio of tokens to be masked in the sentence
+    Return:
+        masked_sent: masked sentence
+        target: target with words which we are not predicting replaced by pad_id
+    """
+    masked_sent = np.copy(sentence)
+    sent_length = len(sentence)
+    mask_num = math.ceil(sent_length * mask_ratio)
+    mask = np.random.choice(sent_length, mask_num)
+    target = np.copy(sentence)
+    for i in range(sent_length):
+        if i in mask:
+            rand = np.random.random()
+            if rand < 0.8:
+                masked_sent[i] = mask_id
+            elif rand < 0.9:
+                # sample random token
+                masked_sent[i] = (
+                    np.random.randint(dictionary_token_range[0], dictionary_token_range[1])
+                )
+        else:
+            target[i] = pad_id
+
+    return masked_sent, target
 
 
 def infer_language_pair(path):
@@ -81,8 +121,8 @@ def filter_by_size(indices, size_fn, max_positions, raise_exception=False):
         size_fn (callable): function that returns the size of a given index
         max_positions (tuple): filter elements larger than this size.
             Comparisons are done component-wise.
-        raise_exception (bool, optional): if ``True``, raise an exception
-            if any elements are filtered. Default: ``False``
+        raise_exception (bool, optional): if ``True``, raise an exception if
+            any elements are filtered (default: False).
     """
     def check_size(idx):
         if isinstance(max_positions, float) or isinstance(max_positions, int):
@@ -92,7 +132,9 @@ def filter_by_size(indices, size_fn, max_positions, raise_exception=False):
             assert isinstance(idx_size, dict)
             intersect_keys = set(max_positions.keys()) & set(idx_size.keys())
             return all(
-                idx_size[key] <= max_positions[key] for key in intersect_keys
+                all(a is None or b is None or a <= b
+                    for a, b in zip(idx_size[key], max_positions[key]))
+                for key in intersect_keys
             )
         else:
             return all(a is None or b is None or a <= b
@@ -128,12 +170,12 @@ def batch_by_size(
         indices (List[int]): ordered list of dataset indices
         num_tokens_fn (callable): function that returns the number of tokens at
             a given index
-        max_tokens (int, optional): max number of tokens in each batch.
-            Default: ``None``
+        max_tokens (int, optional): max number of tokens in each batch
+            (default: None).
         max_sentences (int, optional): max number of sentences in each
-            batch. Default: ``None``
+            batch (default: None).
         required_batch_size_multiple (int, optional): require batch size to
-            be a multiple of N. Default: ``1``
+            be a multiple of N (default: 1).
     """
     max_tokens = max_tokens if max_tokens is not None else float('Inf')
     max_sentences = max_sentences if max_sentences is not None else float('Inf')
@@ -155,6 +197,7 @@ def batch_by_size(
     for idx in indices:
         sample_lens.append(num_tokens_fn(idx))
         sample_len = max(sample_len, sample_lens[-1])
+        assert sample_len <= max_tokens, f"sentence at index {idx} exceeds max_tokens limit!"
         num_tokens = (len(batch) + 1) * sample_len
         if is_batch_full(num_tokens):
             mod_len = max(

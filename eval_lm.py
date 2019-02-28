@@ -16,6 +16,7 @@ import torch
 from fairseq import options, progress_bar, tasks, utils
 from fairseq.meters import StopwatchMeter, TimeMeter
 from fairseq.sequence_scorer import SequenceScorer
+from fairseq.utils import import_user_module
 
 
 class WordStat(object):
@@ -47,6 +48,8 @@ class WordStat(object):
 def main(parsed_args):
     assert parsed_args.path is not None, '--path required for evaluation!'
 
+    import_user_module(parsed_args)
+
     print(parsed_args)
 
     use_cuda = torch.cuda.is_available() and not parsed_args.cpu
@@ -55,7 +58,9 @@ def main(parsed_args):
 
     # Load ensemble
     print('| loading model(s) from {}'.format(parsed_args.path))
-    models, args = utils.load_ensemble_for_inference(parsed_args.path.split(':'), task, model_arg_overrides=eval(parsed_args.model_overrides))
+    models, args = utils.load_ensemble_for_inference(
+        parsed_args.path.split(':'), task, model_arg_overrides=eval(parsed_args.model_overrides),
+    )
 
     for arg in vars(parsed_args).keys():
         if arg not in {'self_target', 'future_target', 'past_target', 'tokens_per_sample', 'output_size_dictionary'}:
@@ -71,6 +76,8 @@ def main(parsed_args):
         model.make_generation_fast_()
         if args.fp16:
             model.half()
+        if use_cuda:
+            model.cuda()
 
     assert len(models) > 0
 
@@ -83,22 +90,24 @@ def main(parsed_args):
         max_positions=utils.resolve_max_positions(*[
             model.max_positions() for model in models
         ]),
+        ignore_invalid_inputs=True,
         num_shards=args.num_shards,
         shard_id=args.shard_id,
-        ignore_invalid_inputs=True,
+        num_workers=args.num_workers,
     ).next_epoch_itr(shuffle=False)
 
     gen_timer = StopwatchMeter()
-    scorer = SequenceScorer(models, task.target_dictionary)
-    if use_cuda:
-        scorer.cuda()
+    scorer = SequenceScorer(task.target_dictionary)
 
     score_sum = 0.
     count = 0
 
     if args.remove_bpe is not None:
-        bpe_cont = args.remove_bpe.rstrip()
-        bpe_toks = set(i for i in range(len(task.dictionary)) if task.dictionary[i].endswith(bpe_cont))
+        if args.remove_bpe == 'sentencepiece':
+            raise NotImplementedError
+        else:
+            bpe_cont = args.remove_bpe.rstrip()
+            bpe_toks = set(i for i in range(len(task.dictionary)) if task.dictionary[i].endswith(bpe_cont))
         bpe_len = len(bpe_cont)
     else:
         bpe_toks = None
@@ -107,10 +116,18 @@ def main(parsed_args):
     word_stats = dict()
 
     with progress_bar.build_progress_bar(args, itr) as t:
-        results = scorer.score_batched_itr(t, cuda=use_cuda, timer=gen_timer)
         wps_meter = TimeMeter()
-        for _, src_tokens, __, hypos in results:
-            for hypo in hypos:
+        for sample in t:
+            sample = utils.move_to_cuda(sample) if use_cuda else sample
+            if 'net_input' not in sample:
+                continue
+
+            gen_timer.start()
+            hypos = scorer.generate(models, sample)
+            gen_timer.stop(sample['ntokens'])
+
+            for hypos_i in hypos:
+                hypo = hypos_i[0]
                 pos_scores = hypo['positional_scores']
 
                 skipped_toks = 0
@@ -156,7 +173,7 @@ def main(parsed_args):
                     if args.output_word_probs:
                         print('\t'.join('{} [{:2f}]'.format(x[0], x[1]) for x in word_prob))
 
-            wps_meter.update(src_tokens.size(0))
+            wps_meter.update(sample['ntokens'])
             t.log({'wps': round(wps_meter.avg)})
 
     avg_nll_loss = -score_sum / count
@@ -168,7 +185,11 @@ def main(parsed_args):
             print(ws)
 
 
-if __name__ == '__main__':
+def cli_main():
     parser = options.get_eval_lm_parser()
     args = options.parse_args_and_arch(parser)
     main(args)
+
+
+if __name__ == '__main__':
+    cli_main()
